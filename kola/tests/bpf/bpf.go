@@ -23,6 +23,7 @@ import (
 
 	"github.com/coreos/mantle/kola/cluster"
 	"github.com/coreos/mantle/kola/register"
+	"github.com/coreos/mantle/util"
 	"github.com/coreos/pkg/capnslog"
 )
 
@@ -65,12 +66,31 @@ func execsnoopTest(c cluster.TestCluster) {
 			c.Fatalf("unable to run SSH command '%s': %v", cmd, err)
 		}
 
-		// sleep 2s to be sure that the container is correctly started
-		time.Sleep(2 * time.Second)
+		// wait for the container and the `execsnoop` command to be correctly started before
+		// generating traffic.
+		if err := util.Retry(5, 2*time.Second, func() error {
+			_ = c.MustSSH(m, "docker ps")
+
+			// we first assert that the container is running and then the process too.
+			// it's not possible to use `docker top...` command because it's the execsnoop itself who takes some time to start.
+			logs, err := c.SSH(m, fmt.Sprintf("sudo cat $(docker inspect --format='{{.LogPath}}' %s)", containerName))
+			if err != nil {
+				return fmt.Errorf("getting running process: %w", err)
+			}
+
+			if len(logs) > 0 {
+				return nil
+			}
+
+			return fmt.Errorf("no logs, the service has not started yet properly")
+		}); err != nil {
+			c.Fatalf("unable to get container ready: %v", err)
+		}
 
 		// generate some "traffic"
-		_ = c.MustSSH(m, "docker ps")
 		_ = c.MustSSH(m, "docker info")
+		_ = c.MustSSH(m, fmt.Sprintf("docker logs %s", containerName))
+		_ = c.MustSSH(m, fmt.Sprintf("docker top %s", containerName))
 
 		plog.Infof("getting logs from %s container", containerName)
 		logs, err := c.SSH(m, fmt.Sprintf("sudo cat $(docker inspect --format='{{.LogPath}}' %s)", containerName))
@@ -101,7 +121,7 @@ func execsnoopTest(c cluster.TestCluster) {
 				c.Fatal("stream should not log to 'stderr'")
 			}
 
-			if strings.Contains(l.Log, "docker info") {
+			if strings.Contains(l.Log, "docker info") || strings.Contains(l.Log, "docker top") || strings.Contains(l.Log, "docker logs") {
 				c.Fatal("log should not container docker info")
 			}
 
